@@ -45,9 +45,6 @@ python -m venv logbook_env
 # Aktivieren
 # Windows:
 logbook_env\Scripts\activate
-
-# Linux/Mac:
-source logbook_env/bin/activate
 ```
 
 ### Schritt 3: Python Dependencies installieren
@@ -69,19 +66,13 @@ pip install -r requirements.txt
 
 **Website:** https://ollama.ai
 
-**Direkte Downloads:**
-- **Windows**: https://ollama.ai/download/windows
-- **Mac**: https://ollama.ai/download/mac  
-- **Linux**: 
-  ```bash
-  curl -fsSL https://ollama.ai/install.sh | sh
-  ```
+---
+
 
 ### Schritt 2: Ollama installieren
 
 - **Windows**: `.exe` Datei ausführen und Installationsanweisungen folgen
 - **Mac**: `.dmg` Datei öffnen und in Applications ziehen
-- **Linux**: Automatische Installation über Curl-Befehl
 
 ### Schritt 3: Ollama Server starten
 

@@ -301,7 +301,7 @@ class LogbookAnalyzer:
     
     def determine_optimal_results(self, scores: List[float], query: str) -> int:
         """Bestimmt automatisch die optimale Anzahl von Ergebnissen basierend auf Relevanz"""
-        if not scores:
+        if not scores or len(scores) == 0:
             return 0
         
         scores = np.array(scores)
@@ -310,20 +310,23 @@ class LogbookAnalyzer:
         high_relevance_threshold = 0.7
         medium_relevance_threshold = 0.5
         
-        high_relevant = np.sum(scores >= high_relevance_threshold)
-        medium_relevant = np.sum(scores >= medium_relevance_threshold)
+        high_relevant = int(np.sum(scores >= high_relevance_threshold))
+        medium_relevant = int(np.sum(scores >= medium_relevance_threshold))
         
         # Methode 2: Relativer Abfall in der Ähnlichkeit
         if len(scores) > 1:
             score_diffs = np.diff(scores)
             # Finde große Sprünge in der Ähnlichkeit
-            mean_diff = np.mean(score_diffs)
-            std_diff = np.std(score_diffs)
-            significant_drop = mean_diff + 1.5 * std_diff
-            
-            drop_indices = np.where(score_diffs < -significant_drop)[0]
-            if len(drop_indices) > 0:
-                natural_cutoff = drop_indices[0] + 1
+            if len(score_diffs) > 0:
+                mean_diff = float(np.mean(score_diffs))
+                std_diff = float(np.std(score_diffs))
+                significant_drop = mean_diff - 1.5 * std_diff  # Negativer Wert für Abfall
+                
+                drop_indices = np.where(score_diffs < significant_drop)[0]
+                if len(drop_indices) > 0:
+                    natural_cutoff = int(drop_indices[0]) + 1
+                else:
+                    natural_cutoff = len(scores)
             else:
                 natural_cutoff = len(scores)
         else:
@@ -363,17 +366,33 @@ class LogbookAnalyzer:
     def semantic_search(self, query: str, max_results: int = 50) -> Tuple[List[int], List[float], int]:
         """Führt semantische Suche durch und bestimmt optimale Ergebnisanzahl"""
         try:
+            # Validierung
+            if self.index is None or self.model is None:
+                logger.error("Index oder Modell nicht verfügbar")
+                return [], [], 0
+            
             # Query Embedding
             query_embedding = self.model.encode([f"Suche: {query}"], convert_to_numpy=True)
             faiss.normalize_L2(query_embedding)
             
+            # Begrenze max_results auf verfügbare Daten
+            available_count = self.index.ntotal
+            actual_max = min(max_results, available_count)
+            
             # Suche mit mehr Ergebnissen für Analyse
-            scores, indices = self.index.search(query_embedding, max_results)
+            scores, indices = self.index.search(query_embedding, actual_max)
+            
+            # Konvertiere zu Python-Listen für sicherere Verarbeitung
+            scores_list = [float(score) for score in scores[0]]
+            indices_list = [int(idx) for idx in indices[0]]
             
             # Bestimme optimale Anzahl
-            optimal_count = self.determine_optimal_results(scores[0], query)
+            optimal_count = self.determine_optimal_results(scores_list, query)
             
-            return indices[0][:optimal_count].tolist(), scores[0][:optimal_count].tolist(), optimal_count
+            # Stelle sicher, dass optimal_count nicht größer als verfügbare Ergebnisse ist
+            optimal_count = min(optimal_count, len(scores_list))
+            
+            return indices_list[:optimal_count], scores_list[:optimal_count], optimal_count
             
         except Exception as e:
             logger.error(f"Fehler bei der semantischen Suche: {e}")
@@ -451,11 +470,15 @@ class LogbookAnalyzer:
             return {"error": "Keine Daten geladen"}
         
         try:
+            logger.info(f"Starte Analyse für Query: '{query}'")
+            
             # Intelligente semantische Suche
             indices, scores, result_count = self.semantic_search(query)
             
-            if not indices:
+            if not indices or result_count == 0:
                 return {"error": "Keine relevanten Ergebnisse gefunden"}
+            
+            logger.info(f"Gefunden: {result_count} relevante Einträge")
             
             # Relevante Einträge extrahieren
             relevant_entries = self.df.iloc[indices].copy()
@@ -472,7 +495,7 @@ class LogbookAnalyzer:
                     f"- Subsystem: {row.get('Subsystem', 'N/A')}\n"
                     f"- Ereignis & Massnahme: {row.get('Ereignis & Massnahme', 'N/A')}\n"
                     f"- Visum: {row.get('Visum', 'N/A')}\n"
-                    f"- Relevanz: {row['similarity_score']:.3f}\n"
+                    f"- Relevanz: {scores[i-1]:.3f}\n"
                 )
             
             context = "\n".join(context_parts)
@@ -486,15 +509,15 @@ class LogbookAnalyzer:
             }
             
             # Automatische LLM-Analyse
-            with st.spinner('🤖 KI-Analyse läuft...'):
-                llm_response = self.query_ollama(query, context)
-                result["llm_analysis"] = llm_response
+            logger.info("Starte LLM-Analyse...")
+            llm_response = self.query_ollama(query, context)
+            result["llm_analysis"] = llm_response
             
             return result
             
         except Exception as e:
             logger.error(f"Fehler bei der Analyse: {e}")
-            return {"error": f"Fehler bei der Analyse: {e}"}
+            return {"error": f"Fehler bei der Analyse: {str(e)}"}
 
 def main():
     st.set_page_config(
@@ -632,50 +655,68 @@ def main():
                         # Embeddings erstellen
                         if analyzer.model is not None:
                             if analyzer.create_embeddings(processed_df):
-                                st.success("✅ Embeddings erstellt - Bereit für Suche!")
+                                st.success("✅ Embeddings erstellt - Bereit für intelligente Suche!")
+                                logger.info("System bereit für Analysen")
                         else:
-                            st.warning("⚠️ Bitte laden Sie zuerst das Embedding-Modell")
-                else:
-                    st.error("❌ CSV-Datei konnte nicht gelesen werden. Bitte prüfen Sie das Format.")
+                            st.warning("⚠️ Embedding-Modell nicht verfügbar")
                             
             except Exception as e:
                 st.error(f"Fehler beim Laden der CSV: {e}")
                 st.info("💡 Tipp: Prüfen Sie Trennzeichen (Komma, Semikolon) und Encoding (UTF-8, Latin1)")
     
     with col2:
-        st.header("🔍 Suche & Analyse")
+        st.header("🔍 Intelligente Suche & KI-Analyse")
         
         if analyzer.df is not None:
-            st.success(f"📊 {len(analyzer.df)} Einträge bereit für Suche")
+            st.success(f"📊 {len(analyzer.df)} Einträge bereit für Analyse")
             
             # Suchbereich
             query = st.text_area(
                 "Ihre Frage/Suchanfrage:",
-                placeholder="z.B. 'Alle Einträge mit Problemen in Lot 12345' oder 'Wann gab es Qualitätsprobleme?'",
+                placeholder="z.B. 'Alle Probleme mit Lot 12345' oder 'Wann gab es Temperaturprobleme in der Heizung?'",
                 height=100
             )
             
-            if st.button("🔍 Suchen", type="primary") and query:
-                with st.spinner("Suche läuft..."):
+            if st.button("🧠 Intelligente Analyse starten", type="primary") and query:
+                with st.spinner("🔍 Suche läuft... (Ergebnisanzahl wird automatisch optimiert)"):
                     results = analyzer.analyze_query(query)
                     
                     if "error" in results:
                         st.error(results["error"])
                     else:
-                        # LLM Antwort (falls verfügbar)
-                        if "llm_analysis" in results:
-                            st.subheader("🤖 KI-Analyse")
-                            st.write(results["llm_analysis"])
-                            st.markdown("---")
+                        # Ergebnis-Header mit Statistiken
+                        col_stat1, col_stat2, col_stat3 = st.columns(3)
+                        with col_stat1:
+                            st.metric("📊 Gefundene Einträge", results["result_count"])
+                        with col_stat2:
+                            st.metric("📈 Gesamt verfügbar", results["total_available"])
+                        with col_stat3:
+                            if len(results["relevant_entries"]) > 0:
+                                avg_score = float(np.mean(results["relevant_entries"]["similarity_score"]))
+                                st.metric("🎯 Ø Relevanz", f"{avg_score:.2f}")
+                            else:
+                                st.metric("🎯 Ø Relevanz", "N/A")
                         
-                        # Suchergebnisse
-                        st.subheader("📋 Gefundene Einträge")
+                        st.markdown("---")
+                        
+                        # KI-Analyse (immer aktiv)
+                        st.subheader("🤖 KI-Analyse")
+                        if "llm_analysis" in results:
+                            st.write(results["llm_analysis"])
+                        else:
+                            st.error("KI-Analyse nicht verfügbar")
+                        
+                        st.markdown("---")
+                        
+                        # Detaillierte Suchergebnisse
+                        st.subheader("📋 Detaillierte Ergebnisse")
+                        st.caption(f"Automatisch optimiert: {results['result_count']} relevanteste Einträge angezeigt")
                         
                         relevant_df = results["relevant_entries"]
                         
                         for i, (_, row) in enumerate(relevant_df.iterrows(), 1):
                             # Relevanz-basierte Farbe
-                            score = row['similarity_score']
+                            score = float(row['similarity_score'])
                             if score >= 0.7:
                                 score_color = "🟢"  # Hoch relevant
                             elif score >= 0.5:
@@ -707,7 +748,24 @@ def main():
                         )
         
         else:
-            st.info("👆 Bitte laden Sie zuerst eine CSV-Datei hoch")
+            st.info("👆 Bitte laden Sie zuerst eine CSV-Datei hoch und verarbeiten Sie die Daten")
+            
+            # Beispiel-CSV anzeigen
+            with st.expander("📄 Beispiel CSV-Format"):
+                example_data = {
+                    'Datum': ['2024-01-15', '2024-01-15', '2024-01-16'],
+                    'Zeit': ['14:30', '15:45', '09:15'],
+                    'Lot-Nr.': ['LOT-001', 'LOT-002', 'LOT-003'],
+                    'Subsystem': ['Pumpe', 'Heizung', 'Ventil'],
+                    'Ereignis & Massnahme': [
+                        'Druckabfall erkannt - Ventil gereinigt',
+                        'Temperatur zu niedrig - Thermostat justiert',
+                        'Ungewöhnliche Geräusche - Wartung durchgeführt'
+                    ],
+                    'Visum': ['MK', 'AB', 'CD']
+                }
+                example_df = pd.DataFrame(example_data)
+                st.dataframe(example_df)
 
 if __name__ == "__main__":
     main()
