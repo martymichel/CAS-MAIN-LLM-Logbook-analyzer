@@ -13,7 +13,6 @@ import os
 import sys
 import io
 from contextlib import redirect_stdout, redirect_stderr
-import threading
 import time
 
 # Torch Import Probleme vermeiden
@@ -277,9 +276,10 @@ class LogbookAnalyzer:
                 
                 # Embeddings erstellen
                 self.embeddings = self.model.encode(
-                    texts, 
+                    texts,
                     show_progress_bar=True,
-                    convert_to_numpy=True
+                    convert_to_numpy=True,
+                    batch_size=32  # Batch-Größe für bessere Performance
                 )
                 
                 # FAISS Index erstellen
@@ -306,62 +306,47 @@ class LogbookAnalyzer:
         
         scores = np.array(scores)
         
-        # Methode 1: Signifikante Ähnlichkeitsschwelle
-        high_relevance_threshold = 0.7
-        medium_relevance_threshold = 0.5
+        # Grundschwellenwerte für Relevanz
+        high_relevance_threshold = 0.6  # Reduziert für mehr Ergebnisse
+        medium_relevance_threshold = 0.4  # Reduziert für mehr Ergebnisse
+        min_relevance_threshold = 0.2   # Neuer minimaler Schwellenwert
         
+        # Zähle relevante Ergebnisse auf verschiedenen Levels
         high_relevant = int(np.sum(scores >= high_relevance_threshold))
         medium_relevant = int(np.sum(scores >= medium_relevance_threshold))
+        min_relevant = int(np.sum(scores >= min_relevance_threshold))
         
-        # Methode 2: Relativer Abfall in der Ähnlichkeit
-        if len(scores) > 1:
-            score_diffs = np.diff(scores)
-            # Finde große Sprünge in der Ähnlichkeit
-            if len(score_diffs) > 0:
-                mean_diff = float(np.mean(score_diffs))
-                std_diff = float(np.std(score_diffs))
-                significant_drop = mean_diff - 1.5 * std_diff  # Negativer Wert für Abfall
-                
-                drop_indices = np.where(score_diffs < significant_drop)[0]
-                if len(drop_indices) > 0:
-                    natural_cutoff = int(drop_indices[0]) + 1
-                else:
-                    natural_cutoff = len(scores)
-            else:
-                natural_cutoff = len(scores)
+        # Adaptiver Ansatz: zeige alle relevanten Ergebnisse
+        if high_relevant >= 5:
+            # Viele hochrelevante: zeige alle + einige mittlere
+            optimal_count = min(high_relevant + min(5, medium_relevant - high_relevant), 25)
+        elif medium_relevant >= 3:
+            # Einige mittelrelevante: zeige alle relevanten
+            optimal_count = min(medium_relevant + min(3, min_relevant - medium_relevant), 20)
+        elif min_relevant >= 1:
+            # Wenige relevante: zeige alle über Mindestschwelle
+            optimal_count = min(min_relevant, 15)
         else:
-            natural_cutoff = len(scores)
+            # Keine wirklich relevanten: zeige Top 5 für Kontext
+            optimal_count = min(5, len(scores))
         
-        # Methode 3: Query-Komplexität berücksichtigen
-        query_words = len(query.split())
-        if query_words <= 2:
-            # Einfache Queries: weniger Ergebnisse
-            complexity_factor = 0.7
-        elif query_words <= 5:
-            # Mittlere Komplexität
-            complexity_factor = 1.0
-        else:
-            # Komplexe Queries: mehr Ergebnisse
-            complexity_factor = 1.3
+        # Query-spezifische Anpassungen
+        query_lower = query.lower()
         
-        # Kombiniere alle Methoden
-        if high_relevant >= 3:
-            # Viele hochrelevante Ergebnisse
-            optimal_count = min(high_relevant + 2, 15)
-        elif medium_relevant >= 5:
-            # Einige mittelrelevante Ergebnisse
-            optimal_count = min(medium_relevant, 12)
-        else:
-            # Wenige relevante Ergebnisse, nutze natürlichen Cutoff
-            optimal_count = min(natural_cutoff, 8)
+        # Bei spezifischen Suchen (Lot-Nummern, Namen, etc.) mehr Ergebnisse
+        if any(keyword in query_lower for keyword in ['lot', 'alle', 'list', 'zeige', 'suche']):
+            optimal_count = min(optimal_count * 2, 30)
         
-        # Anpassung basierend auf Query-Komplexität
-        optimal_count = int(optimal_count * complexity_factor)
+        # Bei Zeitbezug mehr Ergebnisse
+        if any(keyword in query_lower for keyword in ['wann', 'zeit', 'datum', 'letzte', 'heute', 'gestern']):
+            optimal_count = min(optimal_count + 5, 25)
         
-        # Grenzen einhalten
-        optimal_count = max(3, min(optimal_count, 20))
+        # Minimum und Maximum einhalten
+        optimal_count = max(3, min(optimal_count, 35))  # Erhöhtes Maximum
         
         logger.info(f"Automatische Ergebnisanzahl: {optimal_count} (von {len(scores)} verfügbar)")
+        logger.info(f"Relevanz-Verteilung: Hoch: {high_relevant}, Mittel: {medium_relevant}, Min: {min_relevant}")
+        
         return optimal_count
     def semantic_search(self, query: str, max_results: int = 50) -> Tuple[List[int], List[float], int]:
         """Führt semantische Suche durch und bestimmt optimale Ergebnisanzahl"""
@@ -410,21 +395,29 @@ class LogbookAnalyzer:
                 "http://127.0.0.1:11434/api/generate"
             ]
             
+            # Erweiterte System-Prompts für bessere Analyse
             system_prompt = """Du bist ein Experte für die Analyse von Logbuch-Einträgen. 
+            
             Analysiere die gegebenen Daten sorgfältig und beantworte die Frage präzise und strukturiert. 
             Verwende nur Informationen aus den bereitgestellten Daten.
-            Antworte auf Deutsch und strukturiere deine Antwort klar."""
             
-            full_prompt = f"{system_prompt}\n\nKontext-Daten:\n{context}\n\nFrage: {prompt}\n\nAntwort:"
+            WICHTIG: Falls die Anfrage zu unspezifisch ist oder mehr Kontext benötigt, stelle Rückfragen wie:
+            - "Welchen Zeitraum möchten Sie betrachten?"
+            - "Suchen Sie nach einem bestimmten Subsystem?"
+            - "Möchten Sie alle Einträge oder nur Probleme/Erfolge?"
+            
+            Antworte auf Deutsch und strukturiere deine Antwort klar mit Überschriften und Bullet Points wo sinnvoll."""
+            
+            full_prompt = f"{system_prompt}\n\nKontext-Daten:\n{context}\n\nBenutzer-Frage: {prompt}\n\nAntwort:"
             
             payload = {
                 "model": model,
                 "prompt": full_prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,
+                    "temperature": 0.2,  # Etwas höher für Rückfragen
                     "top_p": 0.9,
-                    "num_ctx": 4096
+                    "num_ctx": 6144  # Mehr Kontext für längere Antworten
                 }
             }
             
@@ -655,68 +648,50 @@ def main():
                         # Embeddings erstellen
                         if analyzer.model is not None:
                             if analyzer.create_embeddings(processed_df):
-                                st.success("✅ Embeddings erstellt - Bereit für intelligente Suche!")
-                                logger.info("System bereit für Analysen")
+                                st.success("✅ Embeddings erstellt - Bereit für Suche!")
                         else:
-                            st.warning("⚠️ Embedding-Modell nicht verfügbar")
+                            st.warning("⚠️ Bitte laden Sie zuerst das Embedding-Modell")
+                else:
+                    st.error("❌ CSV-Datei konnte nicht gelesen werden. Bitte prüfen Sie das Format.")
                             
             except Exception as e:
                 st.error(f"Fehler beim Laden der CSV: {e}")
                 st.info("💡 Tipp: Prüfen Sie Trennzeichen (Komma, Semikolon) und Encoding (UTF-8, Latin1)")
     
     with col2:
-        st.header("🔍 Intelligente Suche & KI-Analyse")
+        st.header("🔍 Suche & Analyse")
         
         if analyzer.df is not None:
-            st.success(f"📊 {len(analyzer.df)} Einträge bereit für Analyse")
+            st.success(f"📊 {len(analyzer.df)} Einträge bereit für Suche")
             
             # Suchbereich
             query = st.text_area(
                 "Ihre Frage/Suchanfrage:",
-                placeholder="z.B. 'Alle Probleme mit Lot 12345' oder 'Wann gab es Temperaturprobleme in der Heizung?'",
+                placeholder="z.B. 'Alle Einträge mit Problemen in Lot 12345' oder 'Wann gab es Qualitätsprobleme?'",
                 height=100
             )
             
-            if st.button("🧠 Intelligente Analyse starten", type="primary") and query:
-                with st.spinner("🔍 Suche läuft... (Ergebnisanzahl wird automatisch optimiert)"):
+            if st.button("🔍 Suchen", type="primary") and query:
+                with st.spinner("Suche läuft..."):
                     results = analyzer.analyze_query(query)
                     
                     if "error" in results:
                         st.error(results["error"])
                     else:
-                        # Ergebnis-Header mit Statistiken
-                        col_stat1, col_stat2, col_stat3 = st.columns(3)
-                        with col_stat1:
-                            st.metric("📊 Gefundene Einträge", results["result_count"])
-                        with col_stat2:
-                            st.metric("📈 Gesamt verfügbar", results["total_available"])
-                        with col_stat3:
-                            if len(results["relevant_entries"]) > 0:
-                                avg_score = float(np.mean(results["relevant_entries"]["similarity_score"]))
-                                st.metric("🎯 Ø Relevanz", f"{avg_score:.2f}")
-                            else:
-                                st.metric("🎯 Ø Relevanz", "N/A")
-                        
-                        st.markdown("---")
-                        
-                        # KI-Analyse (immer aktiv)
-                        st.subheader("🤖 KI-Analyse")
+                        # LLM Antwort (falls verfügbar)
                         if "llm_analysis" in results:
+                            st.subheader("🤖 KI-Analyse")
                             st.write(results["llm_analysis"])
-                        else:
-                            st.error("KI-Analyse nicht verfügbar")
+                            st.markdown("---")
                         
-                        st.markdown("---")
-                        
-                        # Detaillierte Suchergebnisse
-                        st.subheader("📋 Detaillierte Ergebnisse")
-                        st.caption(f"Automatisch optimiert: {results['result_count']} relevanteste Einträge angezeigt")
+                        # Suchergebnisse
+                        st.subheader("📋 Gefundene Einträge")
                         
                         relevant_df = results["relevant_entries"]
                         
                         for i, (_, row) in enumerate(relevant_df.iterrows(), 1):
                             # Relevanz-basierte Farbe
-                            score = float(row['similarity_score'])
+                            score = row['similarity_score']
                             if score >= 0.7:
                                 score_color = "🟢"  # Hoch relevant
                             elif score >= 0.5:
@@ -748,24 +723,7 @@ def main():
                         )
         
         else:
-            st.info("👆 Bitte laden Sie zuerst eine CSV-Datei hoch und verarbeiten Sie die Daten")
-            
-            # Beispiel-CSV anzeigen
-            with st.expander("📄 Beispiel CSV-Format"):
-                example_data = {
-                    'Datum': ['2024-01-15', '2024-01-15', '2024-01-16'],
-                    'Zeit': ['14:30', '15:45', '09:15'],
-                    'Lot-Nr.': ['LOT-001', 'LOT-002', 'LOT-003'],
-                    'Subsystem': ['Pumpe', 'Heizung', 'Ventil'],
-                    'Ereignis & Massnahme': [
-                        'Druckabfall erkannt - Ventil gereinigt',
-                        'Temperatur zu niedrig - Thermostat justiert',
-                        'Ungewöhnliche Geräusche - Wartung durchgeführt'
-                    ],
-                    'Visum': ['MK', 'AB', 'CD']
-                }
-                example_df = pd.DataFrame(example_data)
-                st.dataframe(example_df)
+            st.info("👆 Bitte laden Sie zuerst eine CSV-Datei hoch")
 
 if __name__ == "__main__":
     main()
