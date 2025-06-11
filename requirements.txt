@@ -1,13 +1,29 @@
-streamlit>=1.28.0
-pandas>=2.1.0
-numpy>=1.24.0
-sentence-transformers>=2.7.0
-faiss-cpu>=1.7.4
-requests>=2.31.0
-torch>=2.1.0
-transformers>=4.35.0
-tokenizers>=0.15.0
+# Logbuch Analyzer Pro - Requirements
+# Aktualisiert für verbesserte Performance und Genauigkeit
 
-# Zusätzliche Stabilität
-protobuf>=3.20.0
-huggingface-hub>=0.17.0
+# Core Dependencies
+streamlit>=1.28.0
+pandas>=2.0.0
+numpy>=1.24.0
+
+# AI/ML Dependencies - Verbesserte Versionen
+sentence-transformers>=2.2.2  # Für E5-Large Support
+faiss-cpu>=1.7.4             # Für optimierte Vektorsuche
+torch>=2.0.0                 # Neuere PyTorch Version für Stabilität
+transformers>=4.30.0         # Aktuellere Transformers
+
+# Encoding/File Processing - Neue Dependencies
+chardet>=5.0.0               # Automatische Encoding-Erkennung
+openpyxl>=3.1.0             # Für Excel-Unterstützung (optional)
+
+# Network/API
+requests>=2.31.0
+
+# Utilities
+python-dateutil>=2.8.2      # Besseres Datum-Parsing
+regex>=2023.0.0             # Erweiterte Regex-Funktionen
+
+# Development/Testing (optional)
+# pytest>=7.0.0
+# black>=23.0.0
+# flake8>=6.0.0
