@@ -36,9 +36,9 @@ class StreamlitLogHandler(logging.Handler):
 # Sentence Transformers Import nach anderen Imports
 try:
     from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    st.error("sentence-transformers nicht installiert. Bitte installieren Sie es mit: pip install sentence-transformers")
-    st.stop()
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 # Logging Setup mit Streamlit Integration
 logger = logging.getLogger(__name__)
@@ -61,11 +61,16 @@ class LogbookAnalyzer:
         # Optimiertes Modell: Balance zwischen Geschwindigkeit und Qualität
         self.model_name = 'intfloat/multilingual-e5-small'  # Schnell und trotzdem präzise
         self.ollama_status = "unbekannt"
-        self.ollama_model = "deepseek-r1:latest" #
+        self.ollama_model = "deepseek-r1:latest"
         
     def auto_initialize(self):
         """Automatische Initialisierung beim App-Start"""
         try:
+            if not SENTENCE_TRANSFORMERS_AVAILABLE:
+                st.error("❌ sentence-transformers nicht installiert. Bitte installieren Sie es mit: pip install sentence-transformers")
+                logger.error("sentence-transformers nicht verfügbar")
+                return False
+            
             # Embedding-Modell laden
             with st.spinner('🤖 Lade Embedding-Modell (multilingual-e5-small)...'):
                 success = self.load_embedding_model()
@@ -74,13 +79,19 @@ class LogbookAnalyzer:
                     logger.info("Embedding-Modell erfolgreich geladen")
                 else:
                     st.error("❌ Embedding-Modell konnte nicht geladen werden")
-                    # Zeige Fehlerbehebung
                     st.info("💡 Versuchen Sie: pip install --upgrade sentence-transformers")
                     return False
             
-            # Ollama Status prüfen
-            with st.spinner('🦙 Prüfe Ollama-Verbindung...'):
-                self.check_ollama_status()
+            # Ollama Status prüfen - OHNE Spinner hier, da check_ollama_status() eigene Updates macht
+            st.info("🦙 Prüfe Ollama-Verbindung...")
+            ollama_available = self.check_ollama_status()
+            
+            if not ollama_available:
+                st.error("❌ Ollama ist nicht verfügbar. Diese Anwendung benötigt eine funktionierende Ollama-Verbindung.")
+                st.info("💡 Verwenden Sie die Auto-Reparatur in der Sidebar oder starten Sie Ollama manuell")
+                return False
+            else:
+                st.success("✅ Ollama erfolgreich verbunden")
                 
             return success
             
@@ -135,75 +146,305 @@ class LogbookAnalyzer:
             st.code("pip install --upgrade sentence-transformers torch")
             return False
     
-    def check_ollama_status(self):
-        """Prüft Ollama-Status und empfiehlt bessere Modelle"""
+    def kill_existing_ollama_processes(self):
+        """Beendet alle laufenden Ollama-Prozesse robust"""
         try:
+            import subprocess
+            import psutil
+            import signal
+            
+            logger.info("Suche nach laufenden Ollama-Prozessen...")
+            
+            # Finde alle Ollama-Prozesse
+            ollama_processes = []
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    proc_info = proc.info
+                    if proc_info['name'] and 'ollama' in proc_info['name'].lower():
+                        ollama_processes.append(proc)
+                        logger.info(f"Gefunden: Ollama-Prozess PID {proc_info['pid']}")
+                    elif proc_info['cmdline']:
+                        cmdline_str = ' '.join(proc_info['cmdline']).lower()
+                        if 'ollama' in cmdline_str:
+                            ollama_processes.append(proc)
+                            logger.info(f"Gefunden: Ollama in Kommandozeile PID {proc_info['pid']}")
+                except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                    continue
+            
+            if not ollama_processes:
+                logger.info("Keine laufenden Ollama-Prozesse gefunden")
+                return True
+            
+            # Versuche graceful shutdown
+            logger.info(f"Beende {len(ollama_processes)} Ollama-Prozesse...")
+            for proc in ollama_processes:
+                try:
+                    logger.info(f"Beende Prozess PID {proc.pid} (graceful)")
+                    proc.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # Warte auf graceful shutdown
+            time.sleep(3)
+            
+            # Prüfe ob Prozesse noch laufen und force kill wenn nötig
+            for proc in ollama_processes:
+                try:
+                    if proc.is_running():
+                        logger.warning(f"Force kill Prozess PID {proc.pid}")
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            
+            # Finale Wartezeit
+            time.sleep(2)
+            
+            # Verifiziere dass alle Prozesse beendet sind
+            remaining = []
+            for proc in ollama_processes:
+                try:
+                    if proc.is_running():
+                        remaining.append(proc.pid)
+                except psutil.NoSuchProcess:
+                    continue
+            
+            if remaining:
+                logger.error(f"Konnte Prozesse nicht beenden: {remaining}")
+                return False
+            else:
+                logger.info("Alle Ollama-Prozesse erfolgreich beendet")
+                return True
+                
+        except ImportError:
+            logger.error("psutil nicht verfügbar - installieren Sie: pip install psutil")
+            return False
+        except Exception as e:
+            logger.error(f"Fehler beim Beenden der Ollama-Prozesse: {e}")
+            return False
+
+    def start_ollama_server(self):
+        """Startet Ollama-Server robust mit Retry-Logik und Feedback"""
+        try:
+            import subprocess
+            
+            logger.info("Starte Ollama-Server...")
+            
+            # Starte Ollama im Hintergrund
+            if os.name == 'nt':  # Windows
+                process = subprocess.Popen(
+                    ['ollama', 'serve'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    creationflags=subprocess.CREATE_NO_WINDOW
+                )
+            else:  # Unix/Linux/Mac
+                process = subprocess.Popen(
+                    ['ollama', 'serve'],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    preexec_fn=os.setsid
+                )
+            
+            logger.info(f"Ollama-Server gestartet mit PID {process.pid}")
+            
+            # Warte bis Server bereit ist (mit Feedback)
+            max_wait_time = 20  # Reduziert auf 20 Sekunden
+            wait_interval = 1   # Jede Sekunde prüfen
+            
+            for attempt in range(max_wait_time):
+                # Prüfe ob Server erreichbar ist
+                try:
+                    response = requests.get("http://localhost:11434/", timeout=2)
+                    if response.status_code == 200:
+                        logger.info(f"Ollama-Server bereit nach {attempt + 1} Sekunden")
+                        return True
+                except requests.exceptions.RequestException:
+                    # Zeige Progress nur alle 3 Sekunden um UI nicht zu spammen
+                    if attempt % 3 == 0:
+                        logger.debug(f"Server noch nicht bereit (Versuch {attempt + 1})")
+                    time.sleep(wait_interval)
+                    continue
+            
+            logger.error("Ollama-Server nicht rechtzeitig bereit geworden")
+            return False
+            
+        except FileNotFoundError:
+            logger.error("Ollama-Executable nicht gefunden - ist Ollama installiert?")
+            st.error("❌ Ollama nicht gefunden - ist es installiert?")
+            return False
+        except Exception as e:
+            logger.error(f"Fehler beim Starten des Ollama-Servers: {e}")
+            st.error(f"❌ Server-Start Fehler: {e}")
+            return False
+
+    def check_ollama_status(self):
+        """Robuste Ollama-Status-Prüfung mit automatischer Reparatur"""
+        try:
+            # Schritt 1: Prüfe grundsätzliche Erreichbarkeit
             test_urls = [
                 "http://localhost:11434/api/tags",
                 "http://127.0.0.1:11434/api/tags"
             ]
             
+            server_reachable = False
             for url in test_urls:
                 try:
-                    response = requests.get(url, timeout=5)
+                    response = requests.get(url, timeout=10)
                     if response.status_code == 200:
+                        server_reachable = True
                         models_data = response.json()
                         available_models = [model['name'] for model in models_data.get('models', [])]
-                        
-                        # Prüfe auf bessere Modelle
-                        recommended_models = [
-                            "deepseek-r1:latest",
-                            "llama3:latest",
-                        ]
-                        
-                        best_available = None
-                        for rec_model in recommended_models:
-                            if rec_model in available_models:
-                                best_available = rec_model
-                                break
-                        
-                        if best_available:
-                            self.ollama_model = best_available
-                            test_success = self.test_ollama_model()
-                            if test_success:
-                                self.ollama_status = f"✅ Aktiv mit {best_available}"
-                                st.success(f"🦙 Ollama: {self.ollama_status}")
-                                logger.info(f"Ollama funktioniert mit {best_available}")
-                            else:
-                                self.ollama_status = "⚠️ Verbunden, aber Modell antwortet nicht"
-                                st.warning(f"🦙 Ollama: {self.ollama_status}")
-                        else:
-                            self.ollama_status = f"⚠️ Kein empfohlenes Modell verfügbar"
-                            st.warning(f"🦙 Ollama: {self.ollama_status}")
-                            if available_models:
-                                st.info(f"Verfügbare Modelle: {', '.join(available_models[:3])}")
-                                st.info("💡 Empfohlen: `ollama pull deepseek-r1:latest")
-                        return
-                        
-                except requests.exceptions.RequestException:
+                        logger.info(f"Ollama erreichbar mit {len(available_models)} Modellen")
+                        break
+                except requests.exceptions.RequestException as e:
+                    logger.debug(f"URL {url} nicht erreichbar: {e}")
                     continue
             
-            self.ollama_status = "❌ Server nicht erreichbar"
-            st.error(f"🦙 Ollama: {self.ollama_status}")
-            st.info("💡 Starten Sie Ollama mit: `ollama serve`")
+            # Schritt 2: Wenn Server nicht erreichbar, versuche Reparatur
+            if not server_reachable:
+                logger.warning("Ollama-Server nicht erreichbar - starte Reparaturprozess")
+                
+                # 2a: Beende möglicherweise hängende Prozesse
+                st.info("🔧 Bereinige hängende Ollama-Prozesse...")
+                if self.kill_existing_ollama_processes():
+                    st.success("✅ Ollama-Prozesse bereinigt")
+                else:
+                    st.warning("⚠️ Prozessbereinigung teilweise fehlgeschlagen")
+                
+                # 2b: Warte kurz
+                time.sleep(3)
+                
+                # 2c: Starte Server neu
+                st.info("🚀 Starte Ollama-Server neu...")
+                if self.start_ollama_server():
+                    st.success("✅ Ollama-Server gestartet")
+                    server_reachable = True
+                else:
+                    st.error("❌ Ollama-Server-Start fehlgeschlagen")
+                    self.ollama_status = "❌ Server konnte nicht gestartet werden"
+                    return False
             
-        except Exception as e:
-            self.ollama_status = f"❌ Fehler: {str(e)[:50]}"
-            st.error(f"🦙 Ollama: {self.ollama_status}")
-            logger.error(f"Ollama-Status-Check fehlgeschlagen: {e}")
-    
-    def test_ollama_model(self) -> bool:
-        """Testet das Ollama-Modell mit einer einfachen Anfrage"""
-        try:
-            test_prompt = "Antworte nur mit 'OK'"
-            response = self.query_ollama(test_prompt, "", timeout=10)
+            # Schritt 3: Prüfe verfügbare Modelle
+            if server_reachable:
+                try:
+                    response = requests.get("http://localhost:11434/api/tags", timeout=10)
+                    models_data = response.json()
+                    available_models = [model['name'] for model in models_data.get('models', [])]
+                    
+                    # Prüfe auf empfohlene Modelle
+                    recommended_models = [
+                        "deepseek-r1:latest",
+                        "llama3.2:latest",
+                        "llama3:latest",
+                        "qwen2:latest"
+                    ]
+                    
+                    best_available = None
+                    for rec_model in recommended_models:
+                        if rec_model in available_models:
+                            best_available = rec_model
+                            break
+                    
+                    if not best_available and available_models:
+                        # Verwende das erste verfügbare Modell als Fallback
+                        best_available = available_models[0]
+                        logger.warning(f"Kein empfohlenes Modell gefunden, verwende: {best_available}")
+                    
+                    if best_available:
+                        self.ollama_model = best_available
+                        
+                        # Schritt 4: Teste Modell-Funktionalität mit erweiterten Versuchen
+                        st.info(f"🧪 Teste Modell {best_available}...")
+                        test_success = False
+                        
+                        for attempt in range(3):  # 3 Versuche
+                            try:
+                                test_success = self.test_ollama_model()
+                                if test_success:
+                                    break
+                                else:
+                                    logger.warning(f"Modell-Test Versuch {attempt + 1} fehlgeschlagen")
+                                    time.sleep(2)  # Kurze Pause zwischen Versuchen
+                            except Exception as e:
+                                logger.warning(f"Modell-Test Versuch {attempt + 1} Fehler: {e}")
+                                time.sleep(2)
+                        
+                        if test_success:
+                            self.ollama_status = f"✅ Aktiv mit {best_available}"
+                            st.success(f"🦙 Ollama: {self.ollama_status}")
+                            logger.info(f"Ollama vollständig funktionsfähig mit {best_available}")
+                            return True
+                        else:
+                            self.ollama_status = f"⚠️ Modell {best_available} antwortet nicht korrekt"
+                            st.error(f"🦙 Ollama: {self.ollama_status}")
+                            st.info("💡 Versuchen Sie: `ollama pull deepseek-r1:latest`")
+                            return False
+                    else:
+                        self.ollama_status = "❌ Keine Modelle verfügbar"
+                        st.error(f"🦙 Ollama: {self.ollama_status}")
+                        st.info("💡 Installieren Sie ein Modell: `ollama pull deepseek-r1:latest`")
+                        return False
+                        
+                except Exception as e:
+                    logger.error(f"Fehler beim Abrufen der Modelle: {e}")
+                    self.ollama_status = f"❌ API-Fehler: {str(e)[:50]}"
+                    st.error(f"🦙 Ollama: {self.ollama_status}")
+                    return False
             
-            if response and "OK" in response and "❌" not in response:
-                return True
             return False
             
         except Exception as e:
-            logger.error(f"Ollama-Modell-Test fehlgeschlagen: {e}")
+            self.ollama_status = f"❌ Kritischer Fehler: {str(e)[:50]}"
+            st.error(f"🦙 Ollama: {self.ollama_status}")
+            logger.error(f"Kritischer Fehler bei Ollama-Status-Check: {e}")
+            return False
+    
+    def test_ollama_model(self) -> bool:
+        """Testet das Ollama-Modell mit robusten Versuchen"""
+        try:
+            # Mehrere einfache Test-Prompts für bessere Zuverlässigkeit
+            test_prompts = [
+                "Antworte nur mit 'OK'",
+                "Sage nur 'TEST'",
+                "Gib nur 'JA' aus"
+            ]
+            
+            for i, test_prompt in enumerate(test_prompts, 1):
+                try:
+                    logger.info(f"Modell-Test {i}/{len(test_prompts)}: '{test_prompt}'")
+                    
+                    response = self.query_ollama(
+                        test_prompt, 
+                        "", 
+                        timeout=20  # Längerer Timeout für Tests
+                    )
+                    
+                    if response:
+                        response_clean = response.strip().upper()
+                        expected_responses = ['OK', 'TEST', 'JA']
+                        
+                        # Prüfe ob eine erwartete Antwort enthalten ist
+                        for expected in expected_responses:
+                            if expected in response_clean:
+                                logger.info(f"Modell-Test erfolgreich: '{response[:50]}'")
+                                return True
+                        
+                        # Auch akzeptieren wenn Antwort vernünftig ist (nicht leer/Error)
+                        if len(response) > 1 and "error" not in response.lower():
+                            logger.info(f"Modell antwortet vernünftig: '{response[:50]}'")
+                            return True
+                    
+                    logger.warning(f"Test {i} unzureichende Antwort: '{response[:100] if response else 'Keine Antwort'}'")
+                    
+                except Exception as test_error:
+                    logger.warning(f"Test {i} Fehler: {test_error}")
+                    continue
+            
+            logger.error("Alle Modell-Tests fehlgeschlagen")
+            return False
+            
+        except Exception as e:
+            logger.error(f"Kritischer Fehler beim Modell-Test: {e}")
             return False
 
     def detect_encoding_and_separator(self, uploaded_file) -> Tuple[Optional[str], Optional[str]]:
@@ -531,111 +772,44 @@ class LogbookAnalyzer:
             logger.error(f"Fehler beim Erstellen der Embeddings: {e}")
             st.error(f"Fehler beim Erstellen der Embeddings: {e}")
             return False
-    
-    def determine_optimal_results(self, scores: List[float], query: str) -> int:
-        """Verbesserte automatische Bestimmung der optimalen Ergebnisanzahl"""
-        if not scores or len(scores) == 0:
-            return 0
-        
-        scores = np.array(scores)
-        
-        # Angepasste Schwellenwerte für das verbesserte E5-large Modell
-        excellent_threshold = 0.75    # Exzellente Übereinstimmung
-        high_relevance_threshold = 0.65  # Hohe Relevanz
-        medium_relevance_threshold = 0.50  # Mittlere Relevanz
-        min_relevance_threshold = 0.35   # Minimale Relevanz
-        
-        # Zähle Ergebnisse nach Qualitätsstufen
-        excellent = int(np.sum(scores >= excellent_threshold))
-        high_relevant = int(np.sum(scores >= high_relevance_threshold))
-        medium_relevant = int(np.sum(scores >= medium_relevance_threshold))
-        min_relevant = int(np.sum(scores >= min_relevance_threshold))
-        
-        # Intelligente adaptive Logik
-        if excellent >= 3:
-            # Mehrere exzellente Treffer: zeige alle + einige gute
-            optimal_count = min(excellent + min(3, high_relevant - excellent), 20)
-        elif high_relevant >= 2:
-            # Einige hochrelevante: zeige alle relevanten
-            optimal_count = min(high_relevant + min(4, medium_relevant - high_relevant), 25)
-        elif medium_relevant >= 1:
-            # Mittlere Relevanz: zeige alle über mittlerem Schwellenwert
-            optimal_count = min(medium_relevant + min(2, min_relevant - medium_relevant), 15)
-        elif min_relevant >= 1:
-            # Minimale Relevanz: zeige wenige für Kontext
-            optimal_count = min(min_relevant, 10)
-        else:
-            # Keine relevanten: zeige Top 3 für Feedback
-            optimal_count = min(3, len(scores))
-        
-        # Query-spezifische Anpassungen mit verbesserter Erkennung
-        query_lower = query.lower()
-        
-        # Spezifische Suchtypen
-        if any(keyword in query_lower for keyword in ['alle', 'list', 'zeige', 'übersicht', 'vollständig']):
-            optimal_count = min(optimal_count * 2, 40)
-        
-        # Zeitbasierte Suchen
-        if any(keyword in query_lower for keyword in ['wann', 'zeit', 'datum', 'letzte', 'heute', 'gestern', 'monat']):
-            optimal_count = min(optimal_count + 3, 30)
-        
-        # Problem-/Fehlersuchen (oft wichtiger)
-        if any(keyword in query_lower for keyword in ['problem', 'fehler', 'defekt', 'ausfall', 'störung']):
-            optimal_count = min(optimal_count + 2, 25)
-        
-        # Lot-/Batch-spezifische Suchen
-        if any(keyword in query_lower for keyword in ['lot', 'charge', 'batch', 'serie']):
-            optimal_count = min(optimal_count + 5, 35)
-        
-        # Qualitätskontrolle: nicht zu wenige, nicht zu viele
-        optimal_count = max(2, min(optimal_count, 40))
-        
-        logger.info(f"Optimierte Ergebnisanzahl: {optimal_count}")
-        logger.info(f"Qualitäts-Verteilung - Exzellent: {excellent}, Hoch: {high_relevant}, Mittel: {medium_relevant}, Min: {min_relevant}")
-        
-        return optimal_count
 
-    def semantic_search(self, query: str, max_results: int = 60) -> Tuple[List[int], List[float], int]:
-        """Verbesserte semantische Suche mit Query-Optimierung"""
+    def semantic_search(self, query: str) -> Tuple[List[int], List[float], int]:
+        """Semantische Suche OHNE Begrenzung der Ergebnisse"""
         try:
             if self.index is None or self.model is None:
                 logger.error("Index oder Modell nicht verfügbar")
                 return [], [], 0
             
             # Query-Optimierung für E5-Modell
-            # E5 funktioniert besser mit "query:" Prefix für Suchanfragen
             optimized_query = f"query: {query}"
             
             # Erstelle Query-Embedding mit verbesserter Konfiguration
             query_embedding = self.model.encode(
                 [optimized_query],
                 convert_to_numpy=True,
-                normalize_embeddings=True  # Konsistent mit Index-Erstellung
+                normalize_embeddings=True
             )
             
-            # Begrenze Suche auf verfügbare Daten
+            # Suche ALLE verfügbaren Einträge
             available_count = self.index.ntotal
-            actual_max = min(max_results, available_count)
             
-            # Durchführung der Suche
-            scores, indices = self.index.search(query_embedding.astype('float32'), actual_max)
+            # Durchführung der Suche für ALLE Einträge
+            scores, indices = self.index.search(query_embedding.astype('float32'), available_count)
             
             # Konvertiere zu Listen für sichere Verarbeitung
             scores_list = [float(score) for score in scores[0]]
             indices_list = [int(idx) for idx in indices[0]]
             
-            # Bestimme optimale Anzahl mit verbesserter Logik
-            optimal_count = self.determine_optimal_results(scores_list, query)
-            optimal_count = min(optimal_count, len(scores_list))
+            logger.info(f"Semantische Suche abgeschlossen: {len(indices_list)} Einträge gefunden")
             
-            return indices_list[:optimal_count], scores_list[:optimal_count], optimal_count
+            return indices_list, scores_list, len(indices_list)
             
         except Exception as e:
             logger.error(f"Fehler bei der semantischen Suche: {e}")
             return [], [], 0
     
     def query_ollama(self, prompt: str, context: str, model: str = None, timeout: int = 120) -> str:
-        """Robuste Ollama-Anfrage mit erweiterten Fallback-Mechanismen"""
+        """Robuste Ollama-Anfrage - MUSS erfolgreich sein"""
         if model is None:
             model = self.ollama_model
             
@@ -673,7 +847,7 @@ Antworte präzise, strukturiert und professionell auf Deutsch."""
             full_prompt = f"""{system_prompt}
 
 === KONTEXT-DATEN ===
-{context[:4000]}  # Begrenzt für bessere Performance
+{context[:6000]}
 
 === BENUTZER-ANFRAGE ===
 {prompt}
@@ -688,14 +862,14 @@ Antworte präzise, strukturiert und professionell auf Deutsch."""
                     "temperature": 0.1,
                     "top_p": 0.9,
                     "top_k": 40,
-                    "num_ctx": 6144,  # Reduziert für bessere Performance
-                    "num_predict": 1024,  # Kürzere Antworten
+                    "num_ctx": 8192,
+                    "num_predict": 2048,
                     "repeat_penalty": 1.1,
                     "stop": ["=== BENUTZER-ANFRAGE ===", "=== KONTEXT-DATEN ==="]
                 }
             }
             
-            # Versuche verschiedene URLs mit erweiterten Timeouts
+            # Versuche verschiedene URLs
             for url in possible_urls:
                 try:
                     logger.info(f"Sende Anfrage an Ollama: {url}")
@@ -706,77 +880,33 @@ Antworte präzise, strukturiert und professionell auf Deutsch."""
                         answer = result.get('response', '').strip()
                         
                         # Erweiterte Qualitätsprüfung
-                        if (len(answer) > 10 and 
-                            "❌" not in answer and
-                            "error" not in answer.lower()):
+                        if len(answer) > 10 and "error" not in answer.lower():
                             logger.info("Ollama-Antwort erfolgreich erhalten")
                             return answer
                         else:
                             logger.warning(f"Qualitätsprüfung fehlgeschlagen: {answer[:100]}")
-                            continue
+                            raise Exception(f"Unzureichende Antwortqualität von Ollama")
                     else:
-                        logger.warning(f"HTTP {response.status_code}: {response.text}")
-                        continue
+                        logger.error(f"HTTP {response.status_code}: {response.text}")
+                        raise Exception(f"Ollama HTTP Error: {response.status_code}")
                         
                 except requests.exceptions.Timeout:
-                    logger.warning(f"Timeout bei {url} nach {timeout}s")
-                    continue
+                    logger.error(f"Timeout bei {url} nach {timeout}s")
+                    raise Exception(f"Ollama Timeout nach {timeout}s")
                 except requests.exceptions.ConnectionError:
-                    logger.warning(f"Verbindungsfehler bei {url}")
-                    continue
+                    logger.error(f"Verbindungsfehler bei {url}")
+                    raise Exception("Ollama Verbindungsfehler")
                 except requests.exceptions.RequestException as e:
-                    logger.warning(f"Request-Fehler bei {url}: {e}")
-                    continue
+                    logger.error(f"Request-Fehler bei {url}: {e}")
+                    raise Exception(f"Ollama Request-Fehler: {e}")
             
-            # Alle URLs fehlgeschlagen - Fallback
-            logger.warning("Alle Ollama-URLs fehlgeschlagen - verwende Fallback")
-            return self.fallback_analysis(prompt, context)
+            # Alle URLs fehlgeschlagen
+            raise Exception("Alle Ollama-URLs fehlgeschlagen")
                 
         except Exception as e:
             logger.error(f"Kritischer Fehler bei Ollama-Anfrage: {e}")
-            return self.fallback_analysis(prompt, context)
-    
-    def fallback_analysis(self, prompt: str, context: str) -> str:
-        """Verbesserte Fallback-Analyse ohne LLM"""
-        lines = context.split('\n')
-        entry_count = len([line for line in lines if line.startswith('Eintrag')])
-        
-        # Einfache Keyword-Analyse
-        prompt_lower = prompt.lower()
-        context_lower = context.lower()
-        
-        analysis_points = []
-        
-        # Problem-Erkennung
-        if any(word in prompt_lower for word in ['problem', 'fehler', 'defekt', 'ausfall']):
-            problem_indicators = ['fehler', 'problem', 'defekt', 'ausfall', 'störung']
-            problem_count = sum(context_lower.count(word) for word in problem_indicators)
-            analysis_points.append(f"🔍 **Problem-Analyse:** {problem_count} potentielle Probleme erkannt")
-        
-        # Zeit-Analyse
-        if any(word in prompt_lower for word in ['wann', 'zeit', 'datum']):
-            analysis_points.append("📅 **Zeitanalyse:** Chronologische Darstellung der Einträge")
-        
-        # System-Analyse
-        if 'subsystem' in prompt_lower or 'system' in prompt_lower:
-            analysis_points.append("⚙️ **System-Analyse:** Subsystem-spezifische Auswertung")
-        
-        return f"""📊 **Automatische Basis-Analyse** (Ollama nicht verfügbar)
-
-**🎯 Direkte Antwort:**
-Es wurden {entry_count} relevante Einträge zu Ihrer Anfrage gefunden.
-
-**📋 Analyseergebnisse:**
-{chr(10).join(analysis_points) if analysis_points else '- Allgemeine Logbuch-Einträge gefunden'}
-
-**📄 Gefundene Einträge:**
-{context[:800]}{'...' if len(context) > 800 else ''}
-
-**💡 Empfehlung:**
-Für detaillierte KI-Analyse starten Sie Ollama mit: `ollama serve`
-Empfohlenes Modell für beste Qualität: `ollama pull deepseek-r1:latest`
-
-**🔧 Hinweis:** Diese Basis-Analyse basiert auf einfachen Mustern. Für semantische Analyse und intelligente Erkenntnisse ist Ollama erforderlich."""
+            # KEIN Fallback - Fehler weiterreichen
+            raise Exception(f"Ollama-Anfrage fehlgeschlagen: {e}")
 
     def extract_highlighted_entries(self, llm_response: str) -> List[int]:
         """Erweiterte Extraktion von hervorgehobenen Einträgen"""
@@ -804,7 +934,7 @@ Empfohlenes Modell für beste Qualität: `ollama pull deepseek-r1:latest`
                 try:
                     entry_num = int(match)
                     # Plausibilitätsprüfung
-                    if 1 <= entry_num <= 100 and entry_num not in highlighted:
+                    if 1 <= entry_num <= 1000 and entry_num not in highlighted:
                         highlighted.append(entry_num)
                 except ValueError:
                     continue
@@ -834,9 +964,9 @@ Empfohlenes Modell für beste Qualität: `ollama pull deepseek-r1:latest`
             if score >= adaptive_threshold:
                 top_entries.append(i)
         
-        # Fallback: Mindestens Top 20% oder 3 Einträge
-        if len(top_entries) < 3:
-            num_top = max(3, int(len(scores) * 0.2))
+        # Fallback: Mindestens Top 20% oder 5 Einträge
+        if len(top_entries) < 5:
+            num_top = max(5, int(len(scores) * 0.2))
             sorted_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
             top_entries = [i + 1 for i in sorted_indices[:num_top]]
         
@@ -849,17 +979,17 @@ Empfohlenes Modell für beste Qualität: `ollama pull deepseek-r1:latest`
             return {"error": "Keine Daten geladen"}
         
         try:
-            logger.info(f"Starte verbesserte Analyse für: '{query}'")
+            logger.info(f"Starte Analyse für: '{query}'")
             
-            # Erweiterte semantische Suche
+            # Semantische Suche OHNE Begrenzung
             indices, scores, result_count = self.semantic_search(query)
             
             if not indices or result_count == 0:
-                return {"error": "Keine relevanten Ergebnisse gefunden. Versuchen Sie andere Suchbegriffe."}
+                return {"error": "Keine Ergebnisse gefunden. Versuchen Sie andere Suchbegriffe."}
             
-            logger.info(f"Gefunden: {result_count} hochrelevante Einträge")
+            logger.info(f"Gefunden: {result_count} Einträge")
             
-            # Extrahiere und bereichere relevante Einträge
+            # Extrahiere ALLE relevanten Einträge
             relevant_entries = self.df.iloc[indices].copy()
             relevant_entries['similarity_score'] = scores
             
@@ -887,23 +1017,29 @@ Empfohlenes Modell für beste Qualität: `ollama pull deepseek-r1:latest`
                 "query": query,
                 "result_count": result_count,
                 "total_available": len(self.df),
-                "average_relevance": np.mean(scores),
+                "average_relevance": np.mean(scores) if scores else 0,
                 "max_relevance": max(scores) if scores else 0
             }
             
-            # LLM-Analyse mit verbessertem Prompt
-            logger.info("Starte erweiterte LLM-Analyse...")
-            llm_response = self.query_ollama(query, context)
-            result["llm_analysis"] = llm_response
-            
-            # Intelligente Hervorhebung kombinieren
-            highlighted_by_llm = self.extract_highlighted_entries(llm_response)
-            top_relevant = self.get_top_relevant_entries(scores)
-            
-            # Kombiniere und dedupliziere Hervorhebungen
-            all_highlighted = list(set(highlighted_by_llm + top_relevant))
-            all_highlighted.sort()
-            result["highlighted_entries"] = all_highlighted
+            # LLM-Analyse - MUSS erfolgreich sein
+            try:
+                logger.info("Starte LLM-Analyse...")
+                # DIREKT zur Ollama-Anfrage - kein vorheriger Test
+                llm_response = self.query_ollama(query, context)
+                result["llm_analysis"] = llm_response
+                
+                # Intelligente Hervorhebung kombinieren
+                highlighted_by_llm = self.extract_highlighted_entries(llm_response)
+                top_relevant = self.get_top_relevant_entries(scores)
+                
+                # Kombiniere und dedupliziere Hervorhebungen
+                all_highlighted = list(set(highlighted_by_llm + top_relevant))
+                all_highlighted.sort()
+                result["highlighted_entries"] = all_highlighted
+                
+            except Exception as llm_error:
+                logger.error(f"LLM-Analyse fehlgeschlagen: {llm_error}")
+                return {"error": f"LLM-Analyse fehlgeschlagen: {llm_error}. Bitte prüfen Sie die Ollama-Verbindung mit dem manuellen Test-Button."}
             
             # Zusätzliche Metadaten für bessere UX
             result["search_quality"] = "Hoch" if np.mean(scores) > 0.6 else "Mittel" if np.mean(scores) > 0.4 else "Niedrig"
@@ -938,21 +1074,34 @@ def main():
         st.info("🚀 Initialisiere Anwendung...")
         
         # Debug: Prüfe sentence-transformers Import
-        try:
-            import sentence_transformers
-            st.success(f"✅ sentence-transformers verfügbar (Version: {sentence_transformers.__version__})")
-        except ImportError as e:
-            st.error(f"❌ sentence-transformers Import fehlgeschlagen: {e}")
+        if not SENTENCE_TRANSFORMERS_AVAILABLE:
+            st.error("❌ sentence-transformers nicht verfügbar")
             st.code("pip install sentence-transformers")
             st.stop()
+        else:
+            try:
+                import sentence_transformers
+                st.success(f"✅ sentence-transformers verfügbar (Version: {sentence_transformers.__version__})")
+            except Exception as e:
+                st.error(f"❌ sentence-transformers Fehler: {e}")
+                st.stop()
         
         success = analyzer.auto_initialize()
-        st.session_state.initialized = True
+        st.session_state.initialized = success
         
         if not success:
-            st.warning("⚠️ Initialisierung teilweise fehlgeschlagen - App läuft eingeschränkt")
+            st.error("❌ Initialisierung fehlgeschlagen - App kann nicht gestartet werden")
+            st.info("💡 Stellen Sie sicher, dass Ollama läuft und das empfohlene Modell verfügbar ist")
+            st.stop()
+        else:
+            st.success("✅ Initialisierung erfolgreich")
         
         st.rerun()
+    
+    # Prüfe ob alle Komponenten verfügbar sind
+    if not st.session_state.initialized:
+        st.error("❌ Anwendung nicht korrekt initialisiert")
+        st.stop()
     
     # Sidebar für System-Info
     with st.sidebar:
@@ -972,32 +1121,125 @@ def main():
                         st.rerun()
                     else:
                         st.error("❌ Modell-Loading fehlgeschlagen")
-                        st.info("Prüfen Sie die Logs unten für Details")
         
-        # Ollama Status mit manueller Verbindung
+        # Ollama Status mit automatischer Reparatur
         st.markdown(f"🦙 **Ollama:** {analyzer.ollama_status}")
-        if "❌" in analyzer.ollama_status:
-            st.markdown("💡 **Empfehlung:**")
-            st.code("ollama serve")
-            st.code("ollama pull deepseek-r1:latest")
-            
-            # Manueller Verbindungsversuch
-            if st.button("🔄 Ollama neu verbinden"):
-                with st.spinner("Verbinde mit Ollama..."):
-                    analyzer.check_ollama_status()
-                    st.rerun()
-        elif "⚠️" in analyzer.ollama_status:
-            if st.button("🔄 Ollama neu testen"):
-                with st.spinner("Teste Ollama-Verbindung..."):
-                    analyzer.check_ollama_status()
-                    st.rerun()
         
-        # Daten Status mit Zurücksetzen-Option
+        # Erweiterte Ollama-Kontrollen
+        if "❌" in analyzer.ollama_status or "⚠️" in analyzer.ollama_status:
+            st.error("🚨 Ollama-Problem erkannt!")
+            
+            col_repair1, col_repair2 = st.columns(2)
+            
+            with col_repair1:
+                if st.button("🔧 Auto-Reparatur"):
+                    with st.spinner("🔧 Repariere Ollama-Verbindung..."):
+                        # WICHTIG: Rufe check_ollama_status() direkt auf, NICHT die alte test-basierte Version
+                        success = analyzer.check_ollama_status()
+                        if success:
+                            st.success("✅ Ollama repariert!")
+                            st.rerun()
+                        else:
+                            st.error("❌ Reparatur fehlgeschlagen")
+            
+            with col_repair2:
+                if st.button("⚡ Prozesse beenden"):
+                    with st.spinner("⚡ Beende Ollama-Prozesse..."):
+                        if analyzer.kill_existing_ollama_processes():
+                            st.success("✅ Prozesse beendet")
+                            time.sleep(2)
+                            # Versuche automatisch neu zu starten
+                            if analyzer.start_ollama_server():
+                                st.success("🚀 Server neu gestartet")
+                                time.sleep(3)
+                                # WICHTIG: Nur Health-Check, kein Test
+                                analyzer.check_ollama_status()
+                                st.rerun()
+                        else:
+                            st.error("❌ Konnte nicht alle Prozesse beenden")
+            
+            st.markdown("💡 **Manuelle Schritte (falls Auto-Reparatur fehlschlägt):**")
+            st.code("""
+# Windows Task Manager oder:
+taskkill /F /IM ollama.exe
+
+# Dann neu starten:
+ollama serve
+
+# Modell installieren falls nötig:
+ollama pull deepseek-r1:latest
+            """)
+            
+            # Zusätzliche Diagnose-Informationen
+            with st.expander("🔍 Diagnose-Informationen"):
+                try:
+                    import psutil
+                    st.write("**Laufende Ollama-Prozesse:**")
+                    ollama_procs = []
+                    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                        try:
+                            proc_info = proc.info
+                            if (proc_info['name'] and 'ollama' in proc_info['name'].lower()) or \
+                               (proc_info['cmdline'] and any('ollama' in cmd.lower() for cmd in proc_info['cmdline'])):
+                                ollama_procs.append(f"PID {proc_info['pid']}: {proc_info['name']}")
+                        except:
+                            continue
+                    
+                    if ollama_procs:
+                        for proc in ollama_procs:
+                            st.text(proc)
+                    else:
+                        st.text("Keine Ollama-Prozesse gefunden")
+                        
+                except ImportError:
+                    st.warning("psutil nicht verfügbar - installieren Sie: pip install psutil")
+                except Exception as e:
+                    st.error(f"Diagnose-Fehler: {e}")
+                
+                # Port-Check
+                st.write("**Port 11434 Status:**")
+                try:
+                    import socket
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.settimeout(2)
+                    result = sock.connect_ex(('127.0.0.1', 11434))
+                    sock.close()
+                    
+                    if result == 0:
+                        st.success("Port 11434 ist belegt (gut)")
+                    else:
+                        st.error("Port 11434 ist frei (Ollama läuft nicht)")
+                except Exception as e:
+                    st.error(f"Port-Check fehlgeschlagen: {e}")
+        
+        else:
+            st.success("✅ Ollama funktioniert korrekt")
+            col_test1, col_test2 = st.columns(2)
+            
+            with col_test1:
+                if st.button("🧪 Modell-Test"):
+                    with st.spinner("Teste Ollama-Modell..."):
+                        test_result = analyzer.test_ollama_model_on_demand()
+                        if test_result:
+                            st.success("✅ Modell-Test erfolgreich")
+                        else:
+                            st.error("❌ Modell-Test fehlgeschlagen")
+                            st.info("💡 Modell funktioniert möglicherweise trotzdem - Health-Check war erfolgreich")
+            
+            with col_test2:
+                if st.button("📋 Modell-Info"):
+                    models = analyzer.get_ollama_models_fast()
+                    if models:
+                        st.info(f"Verfügbare Modelle: {', '.join(models[:3])}")
+                        st.info(f"Aktives Modell: {analyzer.ollama_model}")
+                    else:
+                        st.warning("Keine Modell-Info verfügbar")
+        
+        # Daten Status
         if analyzer.df is not None:
             st.success(f"📊 Daten: {len(analyzer.df)} Einträge verarbeitet")
             if st.session_state.data_processed:
                 st.success("✅ Embeddings: Erstellt und bereit")
-                # Reset-Option bei Problemen
                 if st.button("🗑️ Daten zurücksetzen"):
                     analyzer.df = None
                     analyzer.index = None
@@ -1012,14 +1254,14 @@ def main():
         
         st.markdown("---")
         
-        # Erweiterte System-Informationen
+        # Performance Metriken
         st.subheader("📊 Performance Metriken")
         if analyzer.df is not None:
             st.metric("Verarbeitete Einträge", len(analyzer.df))
             if hasattr(analyzer, 'embeddings') and analyzer.embeddings is not None:
                 st.metric("Embedding Dimension", analyzer.embeddings.shape[1])
         
-        # System Logs mit mehr Details
+        # System Logs
         st.subheader("📝 System Logs")
         if hasattr(st.session_state, 'log_handler'):
             logs = st.session_state.log_handler.logs[-8:]
@@ -1038,10 +1280,13 @@ def main():
         with st.expander("🔧 Debug Info"):
             st.write("**Python Pfad:**", sys.executable)
             st.write("**Arbeitsverzeichnis:**", os.getcwd())
-            try:
-                import sentence_transformers
-                st.write("**SentenceTransformers:**", sentence_transformers.__version__)
-            except:
+            if SENTENCE_TRANSFORMERS_AVAILABLE:
+                try:
+                    import sentence_transformers
+                    st.write("**SentenceTransformers:**", sentence_transformers.__version__)
+                except:
+                    st.write("**SentenceTransformers:** ❌ Fehler beim Import")
+            else:
                 st.write("**SentenceTransformers:** ❌ Nicht verfügbar")
             
             try:
@@ -1053,14 +1298,31 @@ def main():
         # Refresh und Hilfe
         col1, col2 = st.columns(2)
         with col1:
-            if st.button("🔄 Refresh"):
-                analyzer.check_ollama_status()
-                st.rerun()
+            if st.button("🔄 System Refresh"):
+                with st.spinner("Aktualisiere System-Status..."):
+                    # WICHTIG: Nur Health-Check, kein Modell-Test
+                    analyzer.check_ollama_status()
+                    st.rerun()
         with col2:
             if st.button("❓ Hilfe"):
-                st.info("Tipps: Verwenden Sie spezifische Begriffe für bessere Ergebnisse")
+                st.info("💡 Bei Ollama-Problemen: Auto-Reparatur verwenden oder Prozesse manuell beenden")
+
+    # Prüfe kritische Abhängigkeiten vor Hauptbereich
+    if not st.session_state.initialized:
+        st.error("❌ Anwendung nicht korrekt initialisiert")
+        st.info("🔧 Verwenden Sie die Auto-Reparatur in der Sidebar")
+        st.stop()
     
-    # Hauptbereich - Verbesserte Layout
+    # Zusätzliche Dependency-Checks
+    try:
+        import psutil
+        PSUTIL_AVAILABLE = True
+    except ImportError:
+        PSUTIL_AVAILABLE = False
+        st.warning("⚠️ psutil nicht verfügbar - einige Auto-Reparatur-Funktionen sind eingeschränkt")
+        st.info("💡 Installieren Sie psutil für erweiterte Prozessverwaltung: `pip install psutil`")
+    
+    # Hauptbereich
     col1, col2 = st.columns([1, 2])
     
     with col1:
@@ -1087,7 +1349,6 @@ def main():
                 
                 # Automatische Verarbeitung ohne Button
                 with st.spinner("🔄 Analysiere und lade CSV-Datei..."):
-                    # Robuste CSV-Ladung
                     df, encoding, separator = analyzer.load_csv_robust(uploaded_file)
                     
                     if df is not None:
@@ -1108,12 +1369,10 @@ def main():
                                 
                                 # Automatische Embedding-Erstellung
                                 if analyzer.model is not None:
-                                    with st.spinner("🧠 Erstelle optimierte Embeddings..."):
+                                    with st.spinner("🧠 Erstelle Embeddings..."):
                                         if analyzer.create_embeddings(processed_df):
-                                            st.success("🎯 Bereit für schnelle intelligente Suche!")
+                                            st.success("🎯 Bereit für intelligente Suche!")
                                             st.session_state.data_processed = True
-                                            # KEIN automatisches Rerun mehr!
-                                            # st.rerun() entfernt
                                         else:
                                             st.error("❌ Embedding-Erstellung fehlgeschlagen")
                                             st.session_state.data_processed = False
@@ -1148,70 +1407,77 @@ def main():
             with col_a:
                 st.metric("📊 Einträge", len(analyzer.df))
             with col_b:
-                st.metric("KI-Modell", "E5-Small (schnell)")
+                st.metric("KI-Modell", "E5-Small")
             
             st.markdown("---")
             
-            # Verbesserte Sucheingabe - Enter zum Absenden
+            # Sucheingabe
             query = st.text_input(
                 "🔎 Frage oder Suchanfrage an die Daten:",
                 placeholder="z.B. 'Alle Probleme in Lot 12345' oder 'Wann gab es Qualitätsfehler?'",
-                help="Drücken Sie Enter zum Absenden. Für neue Zeile verwenden Sie Shift+Enter"
+                help="Alle Einträge werden durchsucht und von der KI analysiert"
             )
             
-            # Automatische Suche bei Enter (query change)
+            # Automatische Suche bei Eingabe
             if query and query.strip():
-                with st.spinner("🧠 Führe intelligente Analyse durch..."):
+                with st.spinner("🧠 Führe vollständige KI-Analyse durch..."):
                     results = analyzer.analyze_query(query.strip())
                     
                     if "error" in results:
                         st.error(f"❌ {results['error']}")
+                        
+                        # Hilfe bei Ollama-Problemen
+                        if "Ollama" in results["error"]:
+                            st.info("💡 Prüfen Sie:")
+                            st.code("ollama serve")
+                            st.code("ollama list")  # Zeige verfügbare Modelle
+                            
                     else:
                         # Erfolgs-Metriken
                         col_x, col_y, col_z = st.columns(3)
                         with col_x:
-                            st.metric("Gefunden", results["result_count"])
+                            st.metric("Analysierte Einträge", results["result_count"])
                         with col_y:
                             st.metric("Durchschn. Relevanz", f"{results.get('average_relevance', 0):.3f}")
                         with col_z:
-                            st.metric("Qualität", results.get('search_quality', 'Unbekannt'))
+                            st.metric("Max. Relevanz", f"{results.get('max_relevance', 0):.3f}")
                         
                         # LLM-Antwort prominent anzeigen
                         if "llm_analysis" in results and results["llm_analysis"]:
-                            st.subheader("🤖 KI-Analyse")
+                            st.subheader("🤖 KI-Analyse (alle Einträge)")
                             st.markdown(results["llm_analysis"])
                             st.markdown("---")
                         
                         # Suchergebnisse mit verbesserter Darstellung
-                        st.subheader("📋 Detaillierte Ergebnisse")
+                        st.subheader("📋 Alle durchsuchten Einträge")
                         
                         relevant_df = results["relevant_entries"]
                         highlighted = results.get("highlighted_entries", [])
                         
+                        # Zeige alle Einträge, nicht nur die ersten
                         for i, (_, row) in enumerate(relevant_df.iterrows(), 1):
                             score = row['similarity_score']
                             
-                            # Verbesserte Relevanz-Indikatoren
+                            # Relevanz-Indikatoren
                             if score >= 0.75:
                                 score_indicator = "🟢 Sehr hoch"
-                                score_color = "green"
                             elif score >= 0.60:
                                 score_indicator = "🟡 Hoch"
-                                score_color = "orange"
                             elif score >= 0.45:
                                 score_indicator = "🟠 Mittel"
-                                score_color = "orange"
                             else:
                                 score_indicator = "🔴 Niedrig"
-                                score_color = "red"
                             
                             # Hervorhebung für wichtige Einträge
                             is_highlighted = i in highlighted
                             title_prefix = "⭐ " if is_highlighted else ""
                             
+                            # Nur die ersten 20 automatisch aufklappen, Rest bei Bedarf
+                            auto_expand = is_highlighted or (i <= 20 and score >= 0.4)
+                            
                             with st.expander(
                                 f"{title_prefix}Eintrag {i} - {score_indicator} ({score:.3f})",
-                                expanded=is_highlighted or i <= 3  # Erste 3 automatisch aufgeklappt
+                                expanded=auto_expand
                             ):
                                 # Strukturierte Darstellung
                                 info_col, detail_col = st.columns([1, 2])
@@ -1244,7 +1510,7 @@ def main():
                         with col_down1:
                             csv_data = relevant_df.drop('similarity_score', axis=1).to_csv(index=False)
                             st.download_button(
-                                label="📥 Ergebnisse als CSV",
+                                label="📥 Alle Ergebnisse als CSV",
                                 data=csv_data,
                                 file_name=f"logbuch_analyse_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
                                 mime="text/csv"
@@ -1258,9 +1524,9 @@ def main():
 {query}
 
 ## Zusammenfassung
-- Gefundene Einträge: {results['result_count']}
+- Analysierte Einträge: {results['result_count']}
 - Durchschnittliche Relevanz: {results.get('average_relevance', 0):.3f}
-- Suchqualität: {results.get('search_quality', 'Unbekannt')}
+- Max. Relevanz: {results.get('max_relevance', 0):.3f}
 
 ## KI-Analyse
 {results.get('llm_analysis', 'Nicht verfügbar')}
