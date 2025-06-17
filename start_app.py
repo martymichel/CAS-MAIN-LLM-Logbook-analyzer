@@ -51,9 +51,8 @@ def check_ollama_recommendation():
     print("\n🦙 OLLAMA SETUP-EMPFEHLUNGEN:")
     print("1. Installieren: https://ollama.ai/download")
     print("2. Starten: ollama serve")
-    print("3. Beste Qualität: ollama pull qwen2.5:14b")
-    print("4. Alternative: ollama pull llama3.1:8b")
-    print("5. Kompakt: ollama pull mistral:7b")
+    print("3. ollama pull deepseek-r1:latest")
+
 
 def get_system_info():
     """Zeigt System-Informationen"""

@@ -61,7 +61,7 @@ class LogbookAnalyzer:
         # Optimiertes Modell: Balance zwischen Geschwindigkeit und Qualität
         self.model_name = 'intfloat/multilingual-e5-small'  # Schnell und trotzdem präzise
         self.ollama_status = "unbekannt"
-        self.ollama_model = "llama3.1:8b"  # Größeres Modell für bessere Qualität
+        self.ollama_model = "deepseek-r1:latest" #
         
     def auto_initialize(self):
         """Automatische Initialisierung beim App-Start"""
@@ -152,10 +152,8 @@ class LogbookAnalyzer:
                         
                         # Prüfe auf bessere Modelle
                         recommended_models = [
-                            "qwen2.5:14b",      # Sehr gut für Analyse
-                            "llama3.1:8b",      # Standard
-                            "mistral:7b",       # Alternative
-                            "qwen2.5:7b"        # Kompakt aber gut
+                            "deepseek-r1:latest",
+                            "llama3:latest",
                         ]
                         
                         best_available = None
@@ -179,7 +177,7 @@ class LogbookAnalyzer:
                             st.warning(f"🦙 Ollama: {self.ollama_status}")
                             if available_models:
                                 st.info(f"Verfügbare Modelle: {', '.join(available_models[:3])}")
-                                st.info("💡 Empfohlen: `ollama pull qwen2.5:14b` für beste Qualität")
+                                st.info("💡 Empfohlen: `ollama pull deepseek-r1:latest")
                         return
                         
                 except requests.exceptions.RequestException:
@@ -776,7 +774,7 @@ Es wurden {entry_count} relevante Einträge zu Ihrer Anfrage gefunden.
 
 **💡 Empfehlung:**
 Für detaillierte KI-Analyse starten Sie Ollama mit: `ollama serve`
-Empfohlenes Modell für beste Qualität: `ollama pull qwen2.5:14b`
+Empfohlenes Modell für beste Qualität: `ollama pull deepseek-r1:latest`
 
 **🔧 Hinweis:** Diese Basis-Analyse basiert auf einfachen Mustern. Für semantische Analyse und intelligente Erkenntnisse ist Ollama erforderlich."""
 
@@ -981,7 +979,7 @@ def main():
         if "❌" in analyzer.ollama_status:
             st.markdown("💡 **Empfehlung:**")
             st.code("ollama serve")
-            st.code("ollama pull qwen2.5:14b")
+            st.code("ollama pull deepseek-r1:latest")
             
             # Manueller Verbindungsversuch
             if st.button("🔄 Ollama neu verbinden"):
@@ -1146,7 +1144,7 @@ def main():
         
         if analyzer.df is not None and st.session_state.data_processed:
             # Erfolgreiche Initialisierung anzeigen
-            col_a, col_b, col_c = st.columns(2)
+            col_a, col_b = st.columns(2)
             with col_a:
                 st.metric("📊 Einträge", len(analyzer.df))
             with col_b:
